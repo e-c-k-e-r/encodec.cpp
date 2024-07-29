@@ -32,7 +32,11 @@ https://github.com/PABannier/encodec.cpp/assets/12958149/d11561be-98e9-4504-bba7
 
 ## Usage
 
+<<<<<<< HEAD
 Here are the steps for the Encodec model.
+=======
+Here are the steps for the encodec model.
+>>>>>>> 91e4cb4 (typo: model is encodec not bark. (#42))
 
 ### Get the code
 
