@@ -1,9 +1,10 @@
+#include "ggml.h"
+#include "ggml-cpu.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml.h"
 #include "ggml/src/ggml-impl.h"
 
-#ifdef GGML_USE_CUBLAS
+#ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
 
@@ -232,7 +233,7 @@ bool encodec_load_model_weights(std::ifstream &infile, encodec_model &model, int
     if (!model.backend) {
         // fallback to CPU backend
         fprintf(stderr, "%s: using CPU backend\n", __func__);
-        model.backend = ggml_backend_cpu_init();
+        model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
 
     if (!model.backend) {
