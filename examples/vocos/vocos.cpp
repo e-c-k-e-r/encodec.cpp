@@ -3,9 +3,19 @@ to reconstruct an audio.
 
 Author: Pierre-Antoine Bannier
 */
+#include "ggml.h"
+#include "ggml-cpu.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml.h"
+#include "ggml/src/ggml-impl.h"
+
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
 
 #include <cassert>
 #include <cmath>
@@ -22,12 +32,27 @@ Author: Pierre-Antoine Bannier
 #include "common.h"
 
 #define VOCOS_FILE_MAGIC 'ggml'
+#define VOCOS_MAX_NODES 80000
 
 static const size_t MB = 1024 * 1024;
 
 static void print_tensor(struct ggml_tensor *t) {
     printf("tensor %s: %lld %lld %lld\n", t->name, t->ne[0], t->ne[1], t->ne[2]);
 }
+
+struct vocos_ggml_cgraph_deleter {
+    void operator()(struct ggml_cgraph * cgraph) {
+        if (cgraph->nodes)
+            free(cgraph->nodes);
+        if (cgraph->leafs)
+            free(cgraph->leafs);
+        if (cgraph->visited_hash_set.keys)
+            free(cgraph->visited_hash_set.keys);
+        if (cgraph->grads)
+            free(cgraph->grads);
+        free(cgraph);
+    }
+};
 
 struct vocos_params {
     // Number of threads used for inference
@@ -140,11 +165,16 @@ struct vocos_statistics {
 struct vocos_context {
     struct vocos_model model;
 
+    // computational graph stored on the heap to avoid stack overflows
+    // the computational graph grows with the sequence length (because of the LSTM)
+    // which requires a lot of nodes
+    std::unique_ptr<struct ggml_cgraph, vocos_ggml_cgraph_deleter> gf;
+
     // buffer for model evaluation
     ggml_backend_buffer_t buf_compute;
 
     // custom allocator
-    struct ggml_allocr * allocr = NULL;
+    ggml_gallocr_t allocr = NULL;
 
     // intermediate steps
     struct ggml_tensor * features_t  = NULL;
@@ -183,13 +213,13 @@ const struct vocos_statistics* vocos_get_statistics(struct vocos_context *vctx) 
     return &vctx->stats;
 }
 
-bool vocos_load_model_weights(std::ifstream &fin, struct vocos_model &model) {
-    // verify magic
+bool vocos_load_model_weights(std::ifstream &fin, struct vocos_model &model, int n_gpu_layers) {
+    // verify magic (i.e. ggml signature in hex format)
     {
         uint32_t magic;
         read_safe(fin, magic);
         if (magic != VOCOS_FILE_MAGIC) {
-            std::cerr << "Invalid file magic" << std::endl;
+            fprintf(stderr, "%s: invalid model file (bad magic)\n", __func__);
             return false;
         }
     }
@@ -294,14 +324,34 @@ bool vocos_load_model_weights(std::ifstream &fin, struct vocos_model &model) {
         }
     }
 
+#ifdef GGML_USE_CUDA
+    if (n_gpu_layers > 0) {
+        fprintf(stderr, "%s: using CUDA backend\n", __func__);
+        model.backend = ggml_backend_cuda_init();
+        if (!model.backend) {
+            fprintf(stderr, "%s: ggml_backend_cuda_init() failed\n", __func__);
+        }
+    }
+#endif
+
+#ifdef GGML_USE_METAL
+    if (n_gpu_layers > 0) {
+        fprintf(stderr, "%s: using Metal backend\n", __func__);
+        model.backend = ggml_backend_metal_init();
+        if (!model.backend) {
+            fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
+        }
+    }
+#endif
+
     if (!model.backend) {
         // fallback to CPU backend
         std::cerr << __func__ << ": using CPU backend" << std::endl;
-        model.backend = ggml_backend_cpu_init();
+        model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
 
     if (!model.backend) {
-        std::cerr << __func__ << ": ggml_backend_cpu_init() failed" << std::endl;
+        std::cerr << __func__ << ": ggml_backend_init_by_type() failed" << std::endl;
         return false;
     }
 
@@ -396,10 +446,11 @@ bool vocos_load_model_weights(std::ifstream &fin, struct vocos_model &model) {
         }
     }
 
+    // allocate the model tensors in a backend buffer
+    model.buffer_w = ggml_backend_alloc_ctx_tensors(ctx, model.backend);
+
     // load weights
     {
-        ggml_allocr *alloc = ggml_allocr_new_from_buffer(model.buffer_w);
-
         size_t total_size = 0;
         model.n_loaded = 0;
 
@@ -419,7 +470,7 @@ bool vocos_load_model_weights(std::ifstream &fin, struct vocos_model &model) {
             }
 
             int32_t nelements = 1;
-            int32_t ne[3] = { 1, 1, 1 };
+            int32_t ne[3] = {1, 1, 1};
             for (int i = 0; i < n_dims; i++) {
                 read_safe(fin, ne[i]);
                 nelements *= ne[i];
@@ -431,14 +482,14 @@ bool vocos_load_model_weights(std::ifstream &fin, struct vocos_model &model) {
             name.assign(&buf[0], buf.size());
 
             if (model.tensors.find(name.data()) == model.tensors.end()) {
-                std::cerr << "Unknown tensor name: " << name << std::endl;
+                fprintf(stderr, "%s: unknown tensor '%s' in model file\n", __func__, name.data());
                 return false;
             }
 
             auto tensor = model.tensors[name.data()];
             ggml_set_name(tensor, name.c_str());
             if (ggml_nelements(tensor) != nelements) {
-                std::cerr << "Invalid number of elements for tensor " << name << " (" << ggml_nelements(tensor) << " != " << nelements << ")" << std::endl;
+                fprintf(stderr, "%s: tensor '%s' has wrong size in model file\n", __func__, name.data());
                 return false;
             }
 
@@ -456,10 +507,8 @@ bool vocos_load_model_weights(std::ifstream &fin, struct vocos_model &model) {
                 return false;
             }
 
-            ggml_allocr_alloc(alloc, tensor);
-
-            if (ggml_backend_is_cpu(model.backend)) {
-                // for the CPU and Metal backends, we can read directly into the device memory
+            if (ggml_backend_buffer_is_host(model.buffer_w)) {
+                // for some backends such as CPU and Metal, the tensor data is in system memory and we can read directly into it
                 fin.read(reinterpret_cast<char *>(tensor->data), ggml_nbytes(tensor));
             } else {
                 // read into a temporary buffer first, then copy to device memory
@@ -472,8 +521,7 @@ bool vocos_load_model_weights(std::ifstream &fin, struct vocos_model &model) {
             model.n_loaded++;
         }
 
-        ggml_allocr_free(alloc);
-        printf("%s: model size = %8.2f MB\n", __func__, total_size / 1024.0 / 1024.0);
+        printf("%s: model size = %.2f MB\n", __func__, total_size / 1024.0 / 1024.0);
     }
 
     fin.close();
@@ -493,7 +541,7 @@ struct vocos_context *vocos_load_model(const std::string model_path) {
     struct vocos_context *vctx = new vocos_context();
 
     vctx->model = vocos_model();
-    if (!vocos_load_model_weights(fin, vctx->model)) {
+    if (!vocos_load_model_weights(fin, vctx->model, 0)) {
         std::cerr << "Failed to load model weights" << std::endl;
         delete vctx;
         return nullptr;
@@ -541,7 +589,9 @@ struct ggml_tensor *vocos_forward_encoder(
     codes = ggml_transpose(ctx0, codes);
 
     struct ggml_tensor *features = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, dim, n_q, seq_length);
-    ggml_allocr_alloc(allocr, features);
+    ggml_set_name(features, "features");
+    ggml_set_input(features);
+    // ggml_allocr_alloc(allocr, features);
 
     for (int t = 0; t < seq_length; t++) {
         // [n_q]
@@ -587,7 +637,11 @@ struct ggml_tensor *vocos_forward_decoder(
         ctx0, backbone.embed_w, encoded, 1 /* s0 */, 3 /* p0 */, 1 /* d0 */);
     print_tensor(emb);
     print_tensor(backbone.embed_b);
+    
     emb = ggml_add(ctx0, emb, backbone.embed_b);
+    // struct ggml_tensor* embed_b_expand = ggml_repeat(ctx0, backbone.embed_b, emb); // repeat along time axis
+
+    emb = ggml_add(ctx0, emb, embed_b_expand);
 
     // [dim, seq_length]
     emb = vocos_ada_layer_norm(ctx0, emb, backbone.norm_scale, backbone.norm_shift, bandwidth_id);
@@ -632,7 +686,46 @@ struct ggml_tensor *vocos_forward_decoder(
     return out;
 }
 
-struct ggml_cgraph *vocos_build_graph(
+static struct ggml_cgraph * vocos_ggml_cgraph_create(size_t size) {
+    struct ggml_cgraph * cgraph = (struct ggml_cgraph *)calloc(1, sizeof(struct ggml_cgraph));
+    cgraph->size = size;
+    cgraph->n_nodes = 0;
+    cgraph->n_leafs = 0;
+    cgraph->nodes = (struct ggml_tensor **)calloc(1, size * sizeof(struct ggml_tensor *));
+    cgraph->leafs = (struct ggml_tensor **)calloc(1, size * sizeof(struct ggml_tensor *));
+
+    // next primes after powers of two
+    static const size_t primes[] = {
+        2, 3, 5, 11, 17, 37, 67, 131, 257, 521, 1031,
+        2053, 4099, 8209, 16411, 32771, 65537, 131101,
+        262147, 524309, 1048583, 2097169, 4194319, 8388617,
+        16777259, 33554467, 67108879, 134217757, 268435459,
+        536870923, 1073741827, 2147483659
+    };
+    static const size_t n_primes = sizeof(primes)/sizeof(primes[0]);
+
+    // find the smallest prime that is larger or equal to size
+    size_t l = 0;
+    size_t r = n_primes;
+    while (l < r) {
+        size_t m = (l + r)/2;
+        if (primes[m] < size * 2) {
+            l = m + 1;
+        } else {
+            r = m;
+        }
+    }
+    size_t hash_size = l < n_primes ? primes[l] : (size * 2 + 1);
+
+    cgraph->visited_hash_set.size = hash_size;
+    cgraph->visited_hash_set.keys = (struct ggml_tensor **)calloc(1, hash_size * sizeof(struct ggml_tensor *));
+    cgraph->visited_hash_set.used = (ggml_bitset_t *)calloc(1, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t));
+    cgraph->order = GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT;
+
+    return cgraph;
+}
+
+void vocos_build_graph(
     struct vocos_context *vctx,
     const std::vector<int32_t> codes,
     const vocos_run_mode mode) {
@@ -641,6 +734,8 @@ struct ggml_cgraph *vocos_build_graph(
     const auto & model   = vctx->model;
     const auto & hparams = model.hparams;
     const auto & allocr  = vctx->allocr;
+    
+    auto & gf = vctx->gf;
 
     const int    n_q     = 8;                       // TODO (PAB): hardcoded
     const int n_bins     = 1024;                    // TODO (PAB): hardcoded
@@ -648,7 +743,7 @@ struct ggml_cgraph *vocos_build_graph(
 
     // since we are using ggml-alloc, this buffer only needs enough space to hold the
     // ggml_tensor and ggml_cgraph structs, but not the tensor data
-    static size_t buf_size = ggml_tensor_overhead() * GGML_MAX_NODES + ggml_graph_overhead();
+    static size_t buf_size = ggml_tensor_overhead() * VOCOS_MAX_NODES + ggml_graph_overhead();
     static std::vector<uint8_t> buf(buf_size);
 
     struct ggml_init_params ggml_params = {
@@ -659,44 +754,42 @@ struct ggml_cgraph *vocos_build_graph(
 
     struct ggml_context *ctx0 = ggml_init(ggml_params);
 
-    struct ggml_cgraph *gf = ggml_new_graph(ctx0);
+    gf = std::unique_ptr<struct ggml_cgraph, vocos_ggml_cgraph_deleter>(vocos_ggml_cgraph_create(VOCOS_MAX_NODES));
 
-    struct ggml_tensor *inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, seq_length, n_q);
-    ggml_allocr_alloc(allocr, inp);
+    struct ggml_tensor *inp_codes = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, seq_length, n_q);
+    ggml_set_name(inp_codes, "inp_codes");
+    ggml_set_input(inp_codes);
 
     struct ggml_tensor *bandwidth_id = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
-    ggml_allocr_alloc(allocr, bandwidth_id);
+    ggml_set_name(bandwidth_id, "bandwidth_id");
+    ggml_set_input(bandwidth_id);
 
-    if (!ggml_allocr_is_measure(allocr)) {
-        ggml_backend_tensor_set(inp, codes.data(), 0, codes.size() * sizeof(int32_t));
-
-        // add offsets of shape [n_q] broadcasted to inp
-        // inp + offsets
-        // TODO: can we ensure i / seq_length is floored?
-        for (int i = 0; i < seq_length*n_q; i++) {
-            int32_t v = (i / seq_length) * n_bins;
-            ggml_backend_tensor_set(inp, &v, i * sizeof(int32_t), sizeof(int32_t));
-        }
-
-        ggml_backend_tensor_set(bandwidth_id, &hparams.bandwidth_id, 0, sizeof(int32_t));
-    }
-
-    struct ggml_tensor * encoded  = vocos_forward_encoder(vctx, ctx0, inp);
+    struct ggml_tensor * encoded  = vocos_forward_encoder(vctx, ctx0, inp_codes);
     struct ggml_tensor * decoded  = vocos_forward_decoder(vctx, ctx0, encoded, bandwidth_id);
 
     switch (mode) {
         case vocos_run_mode::full: {
-            ggml_build_forward_expand(gf, decoded);
+            ggml_set_name(encoded, "encoded");
+            ggml_set_output(encoded);
+            ggml_build_forward_expand(gf.get(), encoded);
+            print_tensor( encoded );
+
+            ggml_set_name(decoded, "decoded");
+            ggml_set_output(decoded);
+            ggml_build_forward_expand(gf.get(), decoded);
         } break;
         case vocos_run_mode::encode: {
-            ggml_build_forward_expand(gf, encoded);
+            ggml_set_name(encoded, "encoded");
+            ggml_set_output(encoded);
+            ggml_build_forward_expand(gf.get(), encoded);
         } break;
         case vocos_run_mode::decode: {
-            ggml_build_forward_expand(gf, decoded);
+            ggml_set_name(decoded, "decoded");
+            ggml_set_output(decoded);
+            ggml_build_forward_expand(gf.get(), decoded);
         } break;
         default: {
             fprintf(stderr, "%s: unknown run mode\n", __func__);
-            return NULL;
         } break;
     }
 
@@ -704,32 +797,51 @@ struct ggml_cgraph *vocos_build_graph(
 
     vctx->features_t  = encoded;
     vctx->out_audio_t = decoded;
-
-    return gf;
 }
 
 bool vocos_eval_internal(
     struct vocos_context *vctx,
     const std::vector<int32_t> codes,
     const int n_threads,
-    const vocos_run_mode mode) {
+    const vocos_run_mode mode
+) {
     auto &model = vctx->model;
     auto &allocr = vctx->allocr;
+    auto & gf     = vctx->gf;
+    const auto & hparams = model.hparams;
+
+    const int    n_q     = 8;                       // TODO (PAB): hardcoded
+    const int n_bins     = 1024;                    // TODO (PAB): hardcoded
+    const int seq_length = codes.size() / n_q;
 
     // reset the allocator to free all the memory allocated during the previous inference
-    ggml_allocr_reset(allocr);
+    // ggml_allocr_reset(allocr);
 
-    struct ggml_cgraph *gf = vocos_build_graph(vctx, codes, mode);
+    vocos_build_graph(vctx, codes, mode);
 
     // allocate tensors
-    ggml_allocr_alloc_graph(allocr, gf);
+    ggml_gallocr_alloc_graph(allocr, gf.get());
+
+    // set the graph inputs
+    struct ggml_tensor * inp_codes = ggml_graph_get_tensor(gf.get(), "inp_codes");
+    ggml_backend_tensor_set(inp_codes, codes.data(), 0, codes.size() * ggml_element_size(inp_codes));
+    // add offsets of shape [n_q] broadcasted to inp
+    // inp + offsets
+    // TODO: can we ensure i / seq_length is floored?
+    for (int i = 0; i < seq_length*n_q; i++) {
+        int32_t v = (i / seq_length) * n_bins;
+        ggml_backend_tensor_set(inp_codes, &v, i * sizeof(int32_t), sizeof(int32_t));
+    }
+
+    struct ggml_tensor * bandwidth_id = ggml_graph_get_tensor(gf.get(), "bandwidth_id");
+    ggml_backend_tensor_set(bandwidth_id, &hparams.bandwidth_id, 0, sizeof(int32_t));
 
     // run the computation
     if (ggml_backend_is_cpu(model.backend)) {
         ggml_backend_cpu_set_n_threads(model.backend, n_threads);
     }
 
-    ggml_backend_graph_compute(model.backend, gf);
+    ggml_backend_graph_compute(model.backend, gf.get());
 
     return true;
 }
@@ -774,21 +886,15 @@ bool vocos_eval(
 
     // allocate the compute buffer
     {
-        // alignment required by the backend
-        size_t align = ggml_backend_get_alignment(vctx->model.backend);
-        vctx->allocr = ggml_allocr_new_measure(align);
+        // create a graph allocator with the backend's default buffer type
+        vctx->allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(vctx->model.backend));
 
         // create the graph for memory usage estimation
-        struct ggml_cgraph *gf = vocos_build_graph(vctx, codes, mode);
+        vocos_build_graph(vctx, codes, mode);
 
-        // compute the required memory
-        size_t mem_size = ggml_allocr_alloc_graph(vctx->allocr, gf);
-
-        // recreate the allocator with the required memory
-        ggml_allocr_free(vctx->allocr);
-        vctx->buf_compute = ggml_backend_alloc_buffer(vctx->model.backend, mem_size);
-        vctx->allocr = ggml_allocr_new_from_buffer(vctx->buf_compute);
-
+        // pre-allocate the compute buffer
+        ggml_gallocr_reserve(vctx->allocr, vctx->gf.get());
+        size_t mem_size = ggml_gallocr_get_buffer_size(vctx->allocr, 0);
         fprintf(stderr, "%s: compute buffer size: %.2f MB\n\n", __func__, mem_size / 1024.0 / 1024.0);
     }
 
